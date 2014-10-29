@@ -216,6 +216,10 @@ class StoreClient:
     def _close_socket(self, socket):
         try:
             if socket:
+                try:
+                    socket.shutdown(socket.shutdown(socket.SHUT_RDWR))
+                except socket.error, exp:
+                    logging.error('Error while shutting down socket: ' + str(exp))
                 socket.close()
         except socket.error, exp:
             logging.error('Error while closing socket: ' + str(exp))
