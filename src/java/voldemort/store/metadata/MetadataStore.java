@@ -350,6 +350,9 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
             StoreDefinitionsMapper mapper = new StoreDefinitionsMapper();
             List<StoreDefinition> storeDefinitions = (List<StoreDefinition>) valueObject.getValue();
 
+            // Check for backwards compatibility
+            StoreDefinitionUtils.validateSchemasAsNeeded(storeDefinitions);
+
             // Go through each store definition and do a corresponding put
             for(StoreDefinition storeDef: storeDefinitions) {
                 if(!this.storeNames.contains(storeDef.getName())) {
@@ -912,6 +915,27 @@ public class MetadataStore extends AbstractStorageEngine<ByteArray, byte[], byte
         try {
             StoreUtils.assertValidKeys(keys);
             return StoreUtils.getAll(this, keys, transforms);
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    /**
+     * Utility function to validate if the given store name exists in the store
+     * name list managed by MetadataStore. This is used by the Admin service for
+     * validation before serving a get-metadata request.
+     * 
+     * @param name Name of the store to validate
+     * @return True if the store name exists in the 'storeNames' list. False
+     *         otherwise.
+     */
+    public boolean isValidStore(String name) {
+        readLock.lock();
+        try {
+            if(this.storeNames.contains(name)) {
+                return true;
+            }
+            return false;
         } finally {
             readLock.unlock();
         }

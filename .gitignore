@@ -1,10 +1,9 @@
-config/single_node_cluster/config/STORES
 classes
 dist
-*~
 *.iml
 *.ipr
 *.iws
+*~
 *#
 .#*
 test-output
@@ -23,3 +22,7 @@ voldsys$_*
 .pydevproject
 .gradle
 build
+lib
+.project
+.classpath
+*.class

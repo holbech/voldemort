@@ -19,16 +19,14 @@ package voldemort.tools.admin.command;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.util.Collection;
 import java.util.List;
 
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
 import voldemort.client.protocol.admin.AdminClient;
-import voldemort.cluster.Node;
 import voldemort.store.StoreDefinition;
 import voldemort.tools.admin.AdminParserUtils;
-import voldemort.tools.admin.AdminUtils;
+import voldemort.tools.admin.AdminToolUtils;
 import voldemort.xml.StoreDefinitionsMapper;
 
 import com.google.common.base.Joiner;
@@ -47,9 +45,11 @@ public class AdminCommandStore extends AbstractAdminCommand {
      */
     public static void executeCommand(String[] args) throws Exception {
         String subCmd = (args.length > 0) ? args[0] : "";
-        args = AdminUtils.copyArrayCutFirst(args);
+        args = AdminToolUtils.copyArrayCutFirst(args);
         if(subCmd.equals("add")) {
             SubCommandStoreAdd.executeCommand(args);
+        } else if(subCmd.equals("update")) {
+            SubCommandStoreUpdate.executeCommand(args);
         } else if(subCmd.equals("delete")) {
             SubCommandStoreDelete.executeCommand(args);
         } else if(subCmd.equals("rollback-ro")) {
@@ -71,6 +71,7 @@ public class AdminCommandStore extends AbstractAdminCommand {
         stream.println("Voldemort Admin Tool Store Commands");
         stream.println("-----------------------------------");
         stream.println("add                  Add stores from a \'stores.xml\' file.");
+        stream.println("update               Update store definitions from a \'stores.xml\' file.");
         stream.println("delete               Delete stores.");
         stream.println("rollback-ro          Rollback read-only store to a given version.");
         stream.println("truncate-partition   Remove contents of partitions on a node.");
@@ -90,6 +91,8 @@ public class AdminCommandStore extends AbstractAdminCommand {
         String subCmd = (args.length > 0) ? args[0] : "";
         if(subCmd.equals("add")) {
             SubCommandStoreAdd.printHelp(stream);
+        } else if(subCmd.equals("update")) {
+            SubCommandStoreUpdate.printHelp(stream);
         } else if(subCmd.equals("delete")) {
             SubCommandStoreDelete.printHelp(stream);
         } else if(subCmd.equals("rollback-ro")) {
@@ -191,33 +194,150 @@ public class AdminCommandStore extends AbstractAdminCommand {
             }
 
             // execute command
-            AdminClient adminClient = AdminUtils.getAdminClient(url);
-            Collection<Node> nodes = AdminUtils.getNodes(adminClient, nodeIds, allNodes);
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
-            AdminUtils.checkServerInNormalState(adminClient, nodes);
-            doStoreAdd(adminClient, nodes, storesFile);
+            if(allNodes) {
+                nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
+            }
+
+            AdminToolUtils.assertServerInNormalState(adminClient, nodeIds);
+
+            doStoreAdd(adminClient, nodeIds, storesFile);
         }
 
         /**
          * Adds store on given nodes from a given stores.xml file.
          * 
          * @param adminClient An instance of AdminClient points to given cluster
-         * @param nodes List of nodes to add stores on
+         * @param nodeIds Node ids to add stores on
          * @param storesFile File path of stores.xml to be added
          * @throws IOException
          * 
          */
         public static void doStoreAdd(AdminClient adminClient,
-                                      Collection<Node> nodes,
+                                      List<Integer> nodeIds,
                                       String storesFile) throws IOException {
             List<StoreDefinition> storeDefinitionList = new StoreDefinitionsMapper().readStoreList(new File(storesFile));
             for(StoreDefinition storeDef: storeDefinitionList) {
                 System.out.println("Adding " + storeDef.getName());
-                for(Node node: nodes) {
-                    System.out.println("to node " + node.getId());
-                    adminClient.storeMgmtOps.addStore(storeDef, node.getId());
-                }
+                adminClient.storeMgmtOps.addStore(storeDef, nodeIds);
             }
+        }
+    }
+
+    /**
+     * store update command
+     */
+    public static class SubCommandStoreUpdate extends AbstractAdminCommand {
+
+        /**
+         * Initializes parser
+         * 
+         * @return OptionParser object with all available options
+         */
+        protected static OptionParser getParser() {
+            OptionParser parser = new OptionParser();
+            // help options
+            AdminParserUtils.acceptsHelp(parser);
+            // required options
+            AdminParserUtils.acceptsFile(parser);
+            AdminParserUtils.acceptsUrl(parser);
+            // optional options
+            AdminParserUtils.acceptsNodeMultiple(parser); // either
+                                                          // --node or
+                                                          // --all-nodes
+            AdminParserUtils.acceptsAllNodes(parser); // either --node or
+                                                      // --all-nodes
+            return parser;
+        }
+
+        /**
+         * Prints help menu for command.
+         * 
+         * @param stream PrintStream object for output
+         * @throws IOException
+         */
+        public static void printHelp(PrintStream stream) throws IOException {
+            stream.println();
+            stream.println("NAME");
+            stream.println("  store update - Update store definitions from a \'stores.xml\' file");
+            stream.println();
+            stream.println("SYNOPSIS");
+            stream.println("  store update -f <stores.xml-file-path> -u <url> [-n <node-id-list> | --all-nodes]");
+            stream.println();
+            getParser().printHelpOn(stream);
+            stream.println();
+        }
+
+        /**
+         * Parses command-line and adds store on given nodes from a given
+         * stores.xml file.
+         * 
+         * @param args Command-line input
+         * @param printHelp Tells whether to print help only or execute command
+         *        actually
+         * @throws IOException
+         * 
+         */
+        @SuppressWarnings("unchecked")
+        public static void executeCommand(String[] args) throws IOException {
+
+            OptionParser parser = getParser();
+
+            // declare parameters
+            String storesFile = null;
+            String url = null;
+            List<Integer> nodeIds = null;
+            Boolean allNodes = true;
+
+            // parse command-line input
+            OptionSet options = parser.parse(args);
+            if(options.has(AdminParserUtils.OPT_HELP)) {
+                printHelp(System.out);
+                return;
+            }
+
+            // check required options and/or conflicting options
+            AdminParserUtils.checkRequired(options, AdminParserUtils.OPT_FILE);
+            AdminParserUtils.checkRequired(options, AdminParserUtils.OPT_URL);
+            AdminParserUtils.checkOptional(options,
+                                           AdminParserUtils.OPT_NODE,
+                                           AdminParserUtils.OPT_ALL_NODES);
+
+            // load parameters
+            storesFile = (String) options.valueOf(AdminParserUtils.OPT_FILE);
+            url = (String) options.valueOf(AdminParserUtils.OPT_URL);
+            if(options.has(AdminParserUtils.OPT_NODE)) {
+                nodeIds = (List<Integer>) options.valuesOf(AdminParserUtils.OPT_NODE);
+                allNodes = false;
+            }
+
+            // execute command
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
+
+            if(allNodes) {
+                nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
+            }
+
+            AdminToolUtils.assertServerInNormalState(adminClient, nodeIds);
+
+            doStoreUpdate(adminClient, nodeIds, storesFile);
+        }
+
+        /**
+         * Updates store on given nodes from a given stores.xml file.
+         * 
+         * @param adminClient An instance of AdminClient points to given cluster
+         * @param nodeIds Node ids to update stores on
+         * @param storesFile File path of stores.xml to be updated
+         * @throws IOException
+         * 
+         */
+        public static void doStoreUpdate(AdminClient adminClient,
+                                         List<Integer> nodeIds,
+                                         String storesFile) throws IOException {
+            List<StoreDefinition> storeDefs = new StoreDefinitionsMapper().readStoreList(new File(storesFile));
+            adminClient.metadataMgmtOps.updateRemoteStoreDefList(storeDefs, nodeIds);
         }
     }
 
@@ -326,34 +446,35 @@ public class AdminCommandStore extends AbstractAdminCommand {
             }
 
             // execute command
-            if(!AdminUtils.askConfirm(confirm, "delete store")) {
+            if(!AdminToolUtils.askConfirm(confirm, "delete store")) {
                 return;
             }
 
-            AdminClient adminClient = AdminUtils.getAdminClient(url);
-            Collection<Node> nodes = AdminUtils.getNodes(adminClient, nodeIds, allNodes);
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
-            AdminUtils.checkServerInNormalState(adminClient, nodes);
-            doStoreDelete(adminClient, nodes, storeNames);
+            if(allNodes) {
+                nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
+            }
+
+            AdminToolUtils.assertServerInNormalState(adminClient, nodeIds);
+
+            doStoreDelete(adminClient, nodeIds, storeNames);
         }
 
         /**
          * Deletes given list of stores on given nodes.
          * 
          * @param adminClient An instance of AdminClient points to given cluster
-         * @param nodes List of nodes to add stores on
+         * @param nodeIds Node ids to add stores on
          * @param storeNames List of stores to be deleted
          * 
          */
         public static void doStoreDelete(AdminClient adminClient,
-                                         Collection<Node> nodes,
+                                         List<Integer> nodeIds,
                                          List<String> storeNames) {
             for(String storeName: storeNames) {
                 System.out.println("Deleting " + storeName);
-                for(Node node: nodes) {
-                    System.out.println("from node " + node.getId());
-                    adminClient.storeMgmtOps.deleteStore(storeName, node.getId());
-                }
+                adminClient.storeMgmtOps.deleteStore(storeName, nodeIds);
             }
         }
     }
@@ -474,34 +595,19 @@ public class AdminCommandStore extends AbstractAdminCommand {
             }
 
             // execute command
-            if(!AdminUtils.askConfirm(confirm, "rollback read-only store")) {
+            if(!AdminToolUtils.askConfirm(confirm, "rollback read-only store")) {
                 return;
             }
 
-            AdminClient adminClient = AdminUtils.getAdminClient(url);
-            Collection<Node> nodes = AdminUtils.getNodes(adminClient, nodeIds, allNodes);
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
-            AdminUtils.checkServerInNormalState(adminClient, nodes);
-            doStoreRollbackReadOnly(adminClient, nodes, storeName, pushVersion);
-        }
-
-        /**
-         * Rolls back a given store to a given version.
-         * 
-         * @param adminClient An instance of AdminClient points to given cluster
-         * @param nodes List of nodes to add stores on
-         * @param storeName Name of store to be rolled back
-         * @param pushVersion Version to be rolled back to
-         * 
-         */
-        public static void doStoreRollbackReadOnly(AdminClient adminClient,
-                                                   Collection<Node> nodes,
-                                                   String storeName,
-                                                   long pushVersion) {
-            for(Node node: nodes) {
-                System.out.println("Rollback store " + storeName + " on node " + node.getId());
-                adminClient.readonlyOps.rollbackStore(node.getId(), storeName, pushVersion);
+            if(allNodes) {
+                nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
             }
+
+            AdminToolUtils.assertServerInNormalState(adminClient, nodeIds);
+
+            adminClient.readonlyOps.rollbackStore(nodeIds, storeName, pushVersion);
         }
     }
 
@@ -622,35 +728,40 @@ public class AdminCommandStore extends AbstractAdminCommand {
             System.out.println("  node = " + nodeId);
 
             // execute command
-            if(!AdminUtils.askConfirm(confirm, "truncate partition")) {
+            if(!AdminToolUtils.askConfirm(confirm, "truncate partition")) {
                 return;
             }
 
-            AdminClient adminClient = AdminUtils.getAdminClient(url);
-            Node node = adminClient.getAdminClientCluster().getNodeById(nodeId);
-            storeNames = AdminUtils.getUserStoresOnNode(adminClient, node, storeNames, allStores);
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
-            AdminUtils.checkServerInNormalState(adminClient, node);
-            doStoreTruncatePartition(adminClient, node, storeNames, partIds);
+            if(allStores) {
+                storeNames = AdminToolUtils.getAllUserStoreNamesOnNode(adminClient, nodeId);
+            } else {
+                AdminToolUtils.validateUserStoreNamesOnNode(adminClient, nodeId, storeNames);
+            }
+
+            AdminToolUtils.assertServerInNormalState(adminClient, nodeId);
+
+            doStoreTruncatePartition(adminClient, nodeId, storeNames, partIds);
         }
 
         /**
          * Removes contents of partitions on a single node.
          * 
          * @param adminClient An instance of AdminClient points to given cluster
-         * @param node Node to remove partitions from
+         * @param nodeId Node id to remove partitions from
          * @param storeNames List of stores to remove partitions from
          * @param partIds List of partitions to be removed
          * 
          */
         public static void doStoreTruncatePartition(AdminClient adminClient,
-                                                    Node node,
+                                                    Integer nodeId,
                                                     List<String> storeNames,
                                                     List<Integer> partIds) {
             for(String storeName: storeNames) {
                 System.out.println("Truncating partition " + Joiner.on(", ").join(partIds) + " of "
                                    + storeName);
-                adminClient.storeMntOps.deletePartitions(node.getId(), storeName, partIds, null);
+                adminClient.storeMntOps.deletePartitions(nodeId, storeName, partIds, null);
             }
         }
     }
@@ -760,34 +871,35 @@ public class AdminCommandStore extends AbstractAdminCommand {
             }
 
             // execute command
-            if(!AdminUtils.askConfirm(confirm, "truncate store")) {
+            if(!AdminToolUtils.askConfirm(confirm, "truncate store")) {
                 return;
             }
 
-            AdminClient adminClient = AdminUtils.getAdminClient(url);
-            Collection<Node> nodes = AdminUtils.getNodes(adminClient, nodeIds, allNodes);
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
-            AdminUtils.checkServerInNormalState(adminClient, nodes);
-            doStoreTruncateStore(adminClient, nodes, storeNames);
+            if(allNodes) {
+                nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
+            }
+
+            AdminToolUtils.assertServerInNormalState(adminClient, nodeIds);
+
+            doStoreTruncateStore(adminClient, nodeIds, storeNames);
         }
 
         /**
          * Removes contents of stores.
          * 
          * @param adminClient An instance of AdminClient points to given cluster
-         * @param nodes List of nodes to remove stores from
+         * @param nodeIds Node ids to remove stores from
          * @param storeNames List of stores to be removed
          * 
          */
         public static void doStoreTruncateStore(AdminClient adminClient,
-                                                Collection<Node> nodes,
+                                                List<Integer> nodeIds,
                                                 List<String> storeNames) {
             for(String storeName: storeNames) {
                 System.out.println("Truncating store " + storeName);
-                for(Node node: nodes) {
-                    System.out.println("on node " + node.getId());
-                    adminClient.storeMntOps.truncate(node.getId(), storeName);
-                }
+                adminClient.storeMntOps.truncate(nodeIds, storeName);
             }
         }
     }

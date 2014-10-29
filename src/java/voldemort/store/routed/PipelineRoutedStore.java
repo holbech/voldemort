@@ -88,7 +88,7 @@ public class PipelineRoutedStore extends RoutedStore {
     private boolean zoneRoutingEnabled;
     private PipelineRoutedStats stats;
     private boolean jmxEnabled;
-    private int jmxId;
+    private String identifierString;
     private ZoneAffinity zoneAffinity;
 
     private enum ConfigureNodesType {
@@ -120,7 +120,7 @@ public class PipelineRoutedStore extends RoutedStore {
                                TimeoutConfig timeoutConfig,
                                int clientZoneId,
                                boolean isJmxEnabled,
-                               int jmxId,
+                               String identifierString,
                                ZoneAffinity zoneAffinity) {
         super(storeDef.getName(),
               innerStores,
@@ -148,7 +148,8 @@ public class PipelineRoutedStore extends RoutedStore {
                 logger.warn(String.format(format, this.clientZone.getId()));
             } else {
                 if(logger.isDebugEnabled())
-                    logger.debug(String.format("Client Zone is not specified. Default to Zone %d", this.clientZone.getId()));
+                    logger.debug(String.format("Client Zone is not specified. Default to Zone %d",
+                                               this.clientZone.getId()));
             }
         } else {
             this.clientZone = cluster.getZoneById(clientZoneId);
@@ -169,14 +170,12 @@ public class PipelineRoutedStore extends RoutedStore {
         }
 
         this.jmxEnabled = isJmxEnabled;
-        this.jmxId = jmxId;
+        this.identifierString = identifierString;
         if(this.jmxEnabled) {
             stats = new PipelineRoutedStats();
             JmxUtils.registerMbean(stats,
                                    JmxUtils.createObjectName(JmxUtils.getPackageName(stats.getClass()),
-                                                             getName()
-                                                                     + "-"
-                                                                     + JmxUtils.getJmxId(this.jmxId)));
+                                                             getName() + identifierString));
         }
         if(zoneAffinity != null) {
             this.zoneAffinity = zoneAffinity;
@@ -669,14 +668,22 @@ public class PipelineRoutedStore extends RoutedStore {
         pipeline.setEnableHintedHandoff(isHintedHandoffEnabled());
 
         HintedHandoff hintedHandoff = null;
+        PerformDeleteHintedHandoff deleteHintedHandoffAction = null;
 
-        if(isHintedHandoffEnabled())
+        if(isHintedHandoffEnabled()) {
             hintedHandoff = new HintedHandoff(failureDetector,
                                               slopStores,
                                               nonblockingSlopStores,
                                               handoffStrategy,
                                               pipelineData.getFailedNodes(),
                                               deleteOpTimeout);
+
+            deleteHintedHandoffAction = new PerformDeleteHintedHandoff(pipelineData,
+                                                                       Event.COMPLETED,
+                                                                       key,
+                                                                       version,
+                                                                       hintedHandoff);
+        }
 
         pipeline.addEventAction(Event.STARTED,
                                 new ConfigureNodes<Boolean, BasicPipelineData<Boolean>>(pipelineData,
@@ -697,20 +704,11 @@ public class PipelineRoutedStore extends RoutedStore {
                                                                                                        deleteOpTimeout,
                                                                                                        nonblockingStores,
                                                                                                        hintedHandoff,
+                                                                                                       deleteHintedHandoffAction,
                                                                                                        version));
 
         if(isHintedHandoffEnabled()) {
-            pipeline.addEventAction(Event.RESPONSES_RECEIVED,
-                                    new PerformDeleteHintedHandoff(pipelineData,
-                                                                   Event.COMPLETED,
-                                                                   key,
-                                                                   version,
-                                                                   hintedHandoff));
-            pipeline.addEventAction(Event.ABORTED, new PerformDeleteHintedHandoff(pipelineData,
-                                                                                  Event.ERROR,
-                                                                                  key,
-                                                                                  version,
-                                                                                  hintedHandoff));
+            pipeline.addEventAction(Event.RESPONSES_RECEIVED, deleteHintedHandoffAction);
 
         }
 
@@ -926,7 +924,7 @@ public class PipelineRoutedStore extends RoutedStore {
 
         if(this.jmxEnabled) {
             JmxUtils.unregisterMbean(JmxUtils.createObjectName(JmxUtils.getPackageName(stats.getClass()),
-                                                               getName() + JmxUtils.getJmxId(jmxId)));
+                                                               getName() + identifierString));
         }
 
         if(exception != null)
@@ -959,6 +957,11 @@ public class PipelineRoutedStore extends RoutedStore {
     }
 
     public static boolean isSlopableFailure(Object response) {
+        /**
+         * Not classifying QuotaExceededException as a slopable failure since we
+         * do not want all QuotaExceeded operations to be slopped
+         * 
+         */
         return response instanceof UnreachableStoreException
                || response instanceof PersistenceFailureException;
     }

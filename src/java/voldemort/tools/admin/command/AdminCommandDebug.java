@@ -21,13 +21,16 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintStream;
 import java.io.StringReader;
+import java.io.StringWriter;
+import java.util.AbstractMap;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
@@ -44,7 +47,6 @@ import voldemort.VoldemortException;
 import voldemort.client.protocol.admin.AdminClient;
 import voldemort.client.protocol.admin.QueryKeyResult;
 import voldemort.cluster.Cluster;
-import voldemort.cluster.Node;
 import voldemort.cluster.Zone;
 import voldemort.routing.BaseStoreRoutingPlan;
 import voldemort.routing.StoreRoutingPlan;
@@ -54,11 +56,12 @@ import voldemort.serialization.Serializer;
 import voldemort.serialization.SerializerDefinition;
 import voldemort.serialization.SerializerFactory;
 import voldemort.serialization.json.JsonReader;
+import voldemort.store.InvalidMetadataException;
 import voldemort.store.StoreDefinition;
 import voldemort.store.compress.CompressionStrategy;
 import voldemort.store.compress.CompressionStrategyFactory;
 import voldemort.tools.admin.AdminParserUtils;
-import voldemort.tools.admin.AdminUtils;
+import voldemort.tools.admin.AdminToolUtils;
 import voldemort.utils.ByteArray;
 import voldemort.utils.ByteUtils;
 import voldemort.utils.StoreDefinitionUtils;
@@ -66,6 +69,7 @@ import voldemort.utils.Utils;
 import voldemort.versioning.VectorClock;
 import voldemort.versioning.Versioned;
 
+import com.google.common.base.Objects;
 import com.sleepycat.persist.StoreNotFoundException;
 
 /**
@@ -81,7 +85,7 @@ public class AdminCommandDebug extends AbstractAdminCommand {
      */
     public static void executeCommand(String[] args) throws Exception {
         String subCmd = (args.length > 0) ? args[0] : "";
-        args = AdminUtils.copyArrayCutFirst(args);
+        args = AdminToolUtils.copyArrayCutFirst(args);
         if(subCmd.equals("query-keys")) {
             SubCommandDebugQueryKeys.executeCommand(args);
         } else if(subCmd.equals("route")) {
@@ -226,17 +230,275 @@ public class AdminCommandDebug extends AbstractAdminCommand {
             }
 
             // execute command
-            AdminClient adminClient = AdminUtils.getAdminClient(url);
-            Collection<Node> nodes = AdminUtils.getNodes(adminClient, nodeIds, allNodes);
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
-            doDebugQueryKeys(adminClient, nodes, storeNames, keyStrings, keyType);
+            if(allNodes) {
+                nodeIds = AdminToolUtils.getAllNodeIds(adminClient);
+            }
+
+            doDebugQueryKeys(adminClient, nodeIds, storeNames, keyStrings, keyType);
+        }
+
+        private static void doDebugQueryKey(AdminClient adminClient,
+                                            List<Integer> queryingNodes,
+                                            List<String> storeNames,
+                                            String keyString,
+                                            String keyFormat) throws IOException {
+
+            Map<String, StoreDefinition> storeDefinitions = AdminToolUtils.getUserStoreDefMapOnNode(adminClient,
+                                                                                                    queryingNodes.get(0));
+
+            BufferedWriter out = new BufferedWriter(new OutputStreamWriter(System.out));
+
+            // iterate through stores
+            for(final String storeName: storeNames) {
+                // store definition
+                StoreDefinition storeDefinition = storeDefinitions.get(storeName);
+                if(storeDefinition == null) {
+                    throw new StoreNotFoundException("Store " + storeName + " not found");
+                }
+
+                out.write("STORE_NAME: " + storeDefinition.getName() + "\n");
+
+                // k-v serializer
+                final SerializerDefinition keySerializerDef = storeDefinition.getKeySerializer();
+                final SerializerDefinition valueSerializerDef = storeDefinition.getValueSerializer();
+                SerializerFactory serializerFactory = new DefaultSerializerFactory();
+                @SuppressWarnings("unchecked")
+                final Serializer<Object> keySerializer = (Serializer<Object>) serializerFactory.getSerializer(keySerializerDef);
+                @SuppressWarnings("unchecked")
+                final Serializer<Object> valueSerializer = (Serializer<Object>) serializerFactory.getSerializer(valueSerializerDef);
+
+                // compression strategy
+                final CompressionStrategy keyCompressionStrategy;
+                final CompressionStrategy valueCompressionStrategy;
+                if(keySerializerDef != null && keySerializerDef.hasCompression()) {
+                    keyCompressionStrategy = new CompressionStrategyFactory().get(keySerializerDef.getCompression());
+                } else {
+                    keyCompressionStrategy = null;
+                }
+                if(valueSerializerDef != null && valueSerializerDef.hasCompression()) {
+                    valueCompressionStrategy = new CompressionStrategyFactory().get(valueSerializerDef.getCompression());
+                } else {
+                    valueCompressionStrategy = null;
+                }
+
+                if(keyCompressionStrategy == null) {
+                    out.write("KEY_COMPRESSION_STRATEGY: None\n");
+                } else {
+                    out.write("KEY_COMPRESSION_STRATEGY: " + keyCompressionStrategy.getType()
+                              + "\n");
+                }
+                out.write("KEY_SERIALIZER_NAME: " + keySerializerDef.getName() + "\n");
+                for(Map.Entry<Integer, String> entry: keySerializerDef.getAllSchemaInfoVersions()
+                                                                      .entrySet()) {
+                    out.write(String.format("KEY_SCHEMA VERSION=%d\n", entry.getKey()));
+                    out.write("====================================\n");
+                    out.write(entry.getValue());
+                    out.write("\n====================================\n");
+                }
+                out.write("\n");
+                if(valueCompressionStrategy == null) {
+                    out.write("VALUE_COMPRESSION_STRATEGY: None\n");
+                } else {
+                    out.write("VALUE_COMPRESSION_STRATEGY: " + valueCompressionStrategy.getType()
+                              + "\n");
+                }
+                out.write("VALUE_SERIALIZER_NAME: " + valueSerializerDef.getName() + "\n");
+                for(Map.Entry<Integer, String> entry: valueSerializerDef.getAllSchemaInfoVersions()
+                                                                        .entrySet()) {
+                    out.write(String.format("VALUE_SCHEMA %d\n", entry.getKey()));
+                    out.write("====================================\n");
+                    out.write(entry.getValue());
+                    out.write("\n====================================\n");
+                }
+                out.write("\n");
+
+                // although the streamingOps support multiple keys, we only
+                // query
+                // one key here
+                ByteArray key;
+                try {
+                    if(keyFormat.equals(AdminParserUtils.OPT_JSON)) {
+                        Object keyObject;
+                        String keySerializerName = keySerializerDef.getName();
+                        if(isAvroSchema(keySerializerName)) {
+                            Schema keySchema = Schema.parse(keySerializerDef.getCurrentSchemaInfo());
+                            JsonDecoder decoder = new JsonDecoder(keySchema, keyString);
+                            GenericDatumReader<Object> datumReader = new GenericDatumReader<Object>(keySchema);
+                            keyObject = datumReader.read(null, decoder);
+                        } else if(keySerializerName.equals(DefaultSerializerFactory.JSON_SERIALIZER_TYPE_NAME)) {
+                            JsonReader jsonReader = new JsonReader(new StringReader(keyString));
+                            keyObject = jsonReader.read();
+                        } else {
+                            keyObject = keyString;
+                        }
+
+                        key = new ByteArray(keySerializer.toBytes(keyObject));
+                    } else {
+                        key = new ByteArray(ByteUtils.fromHexString(keyString));
+                    }
+                } catch(SerializationException se) {
+                    System.err.println("Error serializing key " + keyString);
+                    System.err.println("If this is a JSON key, you need to include escaped quotation marks in the command line if it is a string");
+                    se.printStackTrace();
+                    return;
+                } catch(DecoderException de) {
+                    System.err.println("Error decoding key " + keyString);
+                    de.printStackTrace();
+                    return;
+                } catch(IOException io) {
+                    System.err.println("Error parsing avro string " + keyString);
+                    io.printStackTrace();
+                    return;
+                }
+
+                boolean printedKey = false;
+                // A Map<> could have been used instead of List<Entry<>> if
+                // Versioned supported correct hash codes. Read the comment in
+                // Versioned about the issue
+                List<Entry<List<Versioned<byte[]>>, List<Integer>>> nodeValues = new ArrayList<Entry<List<Versioned<byte[]>>, List<Integer>>>();
+                for(final Integer queryNodeId: queryingNodes) {
+                    Iterator<QueryKeyResult> iterator;
+                    iterator = adminClient.streamingOps.queryKeys(queryNodeId,
+                                                                  storeName,
+                                                                  Arrays.asList(key).iterator());
+                    final StringWriter stringWriter = new StringWriter();
+
+                    QueryKeyResult queryKeyResult = iterator.next();
+
+                    if(!printedKey) {
+                        // de-serialize and write key
+                        byte[] keyBytes = queryKeyResult.getKey().get();
+                        Object keyObject = keySerializer.toObject((null == keyCompressionStrategy) ? keyBytes
+                                                                                                  : keyCompressionStrategy.inflate(keyBytes));
+
+                        writeVoldKeyOrValueInternal(keyBytes,
+                                                    keySerializer,
+                                                    keyCompressionStrategy,
+                                                    "KEY",
+                                                    out);
+                        printedKey = true;
+                    }
+
+                    // iterate through, de-serialize and write values
+                    if(queryKeyResult.hasValues() && queryKeyResult.getValues().size() > 0) {
+
+                        int elementId = -1;
+                        for(int i = 0; i < nodeValues.size(); i++) {
+                            if(Objects.equal(nodeValues.get(i).getKey(), queryKeyResult.getValues())) {
+                                elementId = i;
+                                break;
+                            }
+                        }
+
+                        if(elementId == -1) {
+                            ArrayList<Integer> nodes = new ArrayList<Integer>();
+                            nodes.add(queryNodeId);
+                            nodeValues.add(new AbstractMap.SimpleEntry<List<Versioned<byte[]>>, List<Integer>>(queryKeyResult.getValues(),
+                                                                                                               nodes));
+                        } else {
+                            nodeValues.get(elementId).getValue().add(queryNodeId);
+                        }
+
+                        out.write(String.format("\nQueried node %d on store %s\n",
+                                                queryNodeId,
+                                                storeName));
+
+                        int versionCount = 0;
+
+                        if(queryKeyResult.getValues().size() > 1) {
+                            out.write("VALUE " + versionCount + "\n");
+                        }
+
+                        for(Versioned<byte[]> versioned: queryKeyResult.getValues()) {
+
+                            // write version
+                            VectorClock version = (VectorClock) versioned.getVersion();
+                            out.write("VECTOR_CLOCK_BYTE: "
+                                      + ByteUtils.toHexString(version.toBytes()) + "\n");
+                            out.write("VECTOR_CLOCK_TEXT: " + version.toString() + '['
+                                      + new Date(version.getTimestamp()).toString() + "]\n");
+
+                            // write value
+                            byte[] valueBytes = versioned.getValue();
+                            writeVoldKeyOrValueInternal(valueBytes,
+                                                        valueSerializer,
+                                                        valueCompressionStrategy,
+                                                        "VALUE",
+                                                        out);
+                            versionCount++;
+                        }
+                    } // If a node does not host a key, it returns
+                      // invalidmetdata
+                      // exception.
+                    else if(queryKeyResult.hasException()) {
+                        boolean isInvalidMetadataException = queryKeyResult.getException() instanceof InvalidMetadataException;
+
+                        // Print the exception if not InvalidMetadataException
+                        // or
+                        // you are querying only a single node.
+                        if(!isInvalidMetadataException || queryingNodes.size() == 1) {
+                            out.write(String.format("\nNode %d on store %s returned exception\n",
+                                                    queryNodeId,
+                                                    storeName));
+                            out.write(queryKeyResult.getException().toString());
+                            out.write("\n====================================\n");
+                        }
+                    } else {
+                        if(queryingNodes.size() == 1) {
+                            out.write(String.format("\nNode %d on store %s returned NULL\n",
+                                                    queryNodeId,
+                                                    storeName));
+                            out.write("\n====================================\n");
+                        }
+                    }
+                    out.flush();
+                }
+
+                out.write("\n====================================\n");
+                for(Map.Entry<List<Versioned<byte[]>>, List<Integer>> nodeValue: nodeValues) {
+                    out.write("Nodes with same Value "
+                              + Arrays.toString(nodeValue.getValue().toArray()));
+                    out.write("\n====================================\n");
+                }
+                if(nodeValues.size() > 1) {
+                    out.write("\n*** Multiple (" + nodeValues.size()
+                              + ") versions of key/value exist for the key ***\n");
+                }
+                out.flush();
+            }
+        }
+
+        private static void writeVoldKeyOrValueInternal(byte[] input,
+                                                        Serializer<Object> serializer,
+                                                        CompressionStrategy compressionStrategy,
+                                                        String prefix,
+                                                        BufferedWriter out) throws IOException {
+            out.write(prefix + "_BYTES\n====================================\n");
+            out.write(ByteUtils.toHexString(input));
+            out.write("\n====================================\n");
+            try {
+                Object inputObject = serializer.toObject((null == compressionStrategy) ? input
+                                                                                      : compressionStrategy.inflate(input));
+
+                out.write(prefix + "_TEXT\n====================================\n");
+                if(inputObject instanceof GenericRecord) {
+                    out.write(inputObject.toString());
+                } else {
+                    new JsonFactory(new ObjectMapper()).createJsonGenerator(out)
+                                                       .writeObject(inputObject);
+                }
+                out.write("\n====================================\n\n");
+            } catch(SerializationException e) {}
+
         }
 
         /**
          * Queries stores for a set of keys
          * 
          * @param adminClient An instance of AdminClient points to given cluster
-         * @param nodes Nodes to query keys from
+         * @param nodeIds Node ids to query keys from
          * @param storeNames Stores to be queried
          * @param keyStrings Keys to be queried
          * @param keyType Format of the keys: hex, json
@@ -244,199 +506,17 @@ public class AdminCommandDebug extends AbstractAdminCommand {
          * 
          */
         public static void doDebugQueryKeys(AdminClient adminClient,
-                                            Collection<Node> nodes,
+                                            List<Integer> nodeIds,
                                             List<String> storeNames,
                                             List<String> keyStrings,
                                             String keyType) throws IOException {
             // decide queryNode for storeDef
-            Node storeDefNode = nodes.iterator().next();
-            Map<String, StoreDefinition> storeDefinitions = AdminUtils.getUserStoreDefs(adminClient,
-                                                                                        storeDefNode);
-
-            BufferedWriter out = new BufferedWriter(new OutputStreamWriter(System.out));
+            Integer storeDefNodeId = nodeIds.get(0);
+            Map<String, StoreDefinition> storeDefinitions = AdminToolUtils.getUserStoreDefMapOnNode(adminClient,
+                                                                                                    storeDefNodeId);
 
             for(String keyString: keyStrings) {
-                // iterate through stores
-                for(final String storeName: storeNames) {
-                    // store definition
-                    StoreDefinition storeDefinition = storeDefinitions.get(storeName);
-                    if(storeDefinition == null) {
-                        throw new StoreNotFoundException("Store " + storeName + " not found.");
-                    }
-
-                    out.write("STORE_NAME: " + storeDefinition.getName() + "\n");
-
-                    // k-v serializer
-                    final SerializerDefinition keySerializerDef = storeDefinition.getKeySerializer();
-                    final SerializerDefinition valueSerializerDef = storeDefinition.getValueSerializer();
-                    SerializerFactory serializerFactory = new DefaultSerializerFactory();
-                    @SuppressWarnings("unchecked")
-                    final Serializer<Object> keySerializer = (Serializer<Object>) serializerFactory.getSerializer(keySerializerDef);
-                    @SuppressWarnings("unchecked")
-                    final Serializer<Object> valueSerializer = (Serializer<Object>) serializerFactory.getSerializer(valueSerializerDef);
-
-                    // compression strategy
-                    final CompressionStrategy keyCompressionStrategy;
-                    final CompressionStrategy valueCompressionStrategy;
-                    if(keySerializerDef != null && keySerializerDef.hasCompression()) {
-                        keyCompressionStrategy = new CompressionStrategyFactory().get(keySerializerDef.getCompression());
-                    } else {
-                        keyCompressionStrategy = null;
-                    }
-                    if(valueSerializerDef != null && valueSerializerDef.hasCompression()) {
-                        valueCompressionStrategy = new CompressionStrategyFactory().get(valueSerializerDef.getCompression());
-                    } else {
-                        valueCompressionStrategy = null;
-                    }
-
-                    if(keyCompressionStrategy == null) {
-                        out.write("KEY_COMPRESSION_STRATEGY: None\n");
-                    } else {
-                        out.write("KEY_COMPRESSION_STRATEGY: " + keyCompressionStrategy.getType()
-                                  + "\n");
-                    }
-                    out.write("KEY_SERIALIZER_NAME: " + keySerializerDef.getName() + "\n");
-                    for(Map.Entry<Integer, String> entry: keySerializerDef.getAllSchemaInfoVersions()
-                                                                          .entrySet()) {
-                        out.write(String.format("KEY_SCHEMA VERSION=%d\n", entry.getKey()));
-                        out.write("====================================\n");
-                        out.write(entry.getValue());
-                        out.write("\n====================================\n");
-                    }
-                    out.write("\n");
-                    if(valueCompressionStrategy == null) {
-                        out.write("VALUE_COMPRESSION_STRATEGY: None\n");
-                    } else {
-                        out.write("VALUE_COMPRESSION_STRATEGY: "
-                                  + valueCompressionStrategy.getType() + "\n");
-                    }
-                    out.write("VALUE_SERIALIZER_NAME: " + valueSerializerDef.getName() + "\n");
-                    for(Map.Entry<Integer, String> entry: valueSerializerDef.getAllSchemaInfoVersions()
-                                                                            .entrySet()) {
-                        out.write(String.format("VALUE_SCHEMA %d\n", entry.getKey()));
-                        out.write("====================================\n");
-                        out.write(entry.getValue());
-                        out.write("\n====================================\n");
-                    }
-                    out.write("\n");
-
-                    // although the streamingOps support multiple keys, we only
-                    // query one key here
-                    ByteArray key;
-                    try {
-                        if(keyType.equals(AdminParserUtils.OPT_JSON)) {
-                            Object keyObject;
-                            String keySerializerName = keySerializerDef.getName();
-                            if(isAvroSchema(keySerializerName)) {
-                                Schema keySchema = Schema.parse(keySerializerDef.getCurrentSchemaInfo());
-                                JsonDecoder decoder = new JsonDecoder(keySchema, keyString);
-                                GenericDatumReader<Object> datumReader = new GenericDatumReader<Object>(keySchema);
-                                keyObject = datumReader.read(null, decoder);
-                            } else if(keySerializerName.equals(DefaultSerializerFactory.JSON_SERIALIZER_TYPE_NAME)) {
-                                JsonReader jsonReader = new JsonReader(new StringReader(keyString));
-                                keyObject = jsonReader.read();
-                            } else {
-                                keyObject = keyString;
-                            }
-
-                            key = new ByteArray(keySerializer.toBytes(keyObject));
-                        } else if(keyType.equals(AdminParserUtils.OPT_HEX)) {
-                            key = new ByteArray(ByteUtils.fromHexString(keyString));
-                        } else {
-                            key = null;
-                        }
-                    } catch(SerializationException se) {
-                        System.err.println("Error serializing key " + keyString);
-                        System.err.println("If this is a JSON key, you need to include escaped quotation marks in the command line if it is a string");
-                        se.printStackTrace();
-                        return;
-                    } catch(DecoderException de) {
-                        System.err.println("Error decoding key " + keyString);
-                        de.printStackTrace();
-                        return;
-                    } catch(IOException io) {
-                        System.err.println("Error parsing avro string " + keyString);
-                        io.printStackTrace();
-                        return;
-                    }
-
-                    boolean printedKey = false;
-                    for(Node node: nodes) {
-                        Iterator<QueryKeyResult> iterator;
-                        iterator = adminClient.streamingOps.queryKeys(node.getId(),
-                                                                      storeName,
-                                                                      Arrays.asList(key).iterator());
-                        // final StringWriter stringWriter = new StringWriter();
-
-                        QueryKeyResult queryKeyResult = iterator.next();
-                        // de-serialize and write key
-                        byte[] keyBytes = queryKeyResult.getKey().get();
-                        Object keyObject = keySerializer.toObject((null == keyCompressionStrategy) ? keyBytes
-                                                                                                  : keyCompressionStrategy.inflate(keyBytes));
-
-                        if(!printedKey) {
-                            out.write("KEY_BYTES\n====================================\n");
-                            out.write(queryKeyResult.getKey().toString());
-                            out.write("\n====================================\n");
-                            out.write("KEY_TEXT\n====================================\n");
-                            if(keyObject instanceof GenericRecord) {
-                                out.write(keyObject.toString());
-                            } else {
-                                new JsonFactory(new ObjectMapper()).createJsonGenerator(out)
-                                                                   .writeObject(keyObject);
-                            }
-                            out.write("\n====================================\n\n");
-                            printedKey = true;
-                        }
-                        out.write(String.format("\nQueried node %d on store %s\n",
-                                                node.getId(),
-                                                storeName));
-
-                        // iterate through, de-serialize and write values
-                        if(queryKeyResult.hasValues() && queryKeyResult.getValues().size() > 0) {
-                            int versionCount = 0;
-
-                            out.write("VALUE " + versionCount + "\n");
-
-                            for(Versioned<byte[]> versioned: queryKeyResult.getValues()) {
-
-                                // write version
-                                VectorClock version = (VectorClock) versioned.getVersion();
-                                out.write("VECTOR_CLOCK_BYTE: "
-                                          + ByteUtils.toHexString(version.toBytes()) + "\n");
-                                out.write("VECTOR_CLOCK_TEXT: " + version.toString() + '['
-                                          + new Date(version.getTimestamp()).toString() + "]\n");
-
-                                // write value
-                                byte[] valueBytes = versioned.getValue();
-                                out.write("VALUE_BYTE\n====================================\n");
-                                out.write(ByteUtils.toHexString(valueBytes));
-                                out.write("\n====================================\n");
-                                out.write("VALUE_TEXT\n====================================\n");
-                                Object valueObject = valueSerializer.toObject((null == valueCompressionStrategy) ? valueBytes
-                                                                                                                : valueCompressionStrategy.inflate(valueBytes));
-                                if(valueObject instanceof GenericRecord) {
-                                    out.write(valueObject.toString());
-                                } else {
-                                    new JsonFactory(new ObjectMapper()).createJsonGenerator(out)
-                                                                       .writeObject(valueObject);
-                                }
-                                out.write("\n====================================\n");
-                                versionCount++;
-                            }
-                        } else {
-                            out.write("VALUE_RESPONSE\n====================================\n");
-                            // write null or exception
-                            if(queryKeyResult.hasException()) {
-                                out.write(queryKeyResult.getException().toString());
-                            } else {
-                                out.write("null");
-                            }
-                            out.write("\n====================================\n");
-                        }
-                        out.flush();
-                    }
-                }
+                doDebugQueryKey(adminClient, nodeIds, storeNames, keyString, keyType);
             }
         }
 
@@ -550,7 +630,7 @@ public class AdminCommandDebug extends AbstractAdminCommand {
             url = (String) options.valueOf(AdminParserUtils.OPT_URL);
 
             // execute command
-            AdminClient adminClient = AdminUtils.getAdminClient(url);
+            AdminClient adminClient = AdminToolUtils.getAdminClient(url);
 
             doDebugRoute(adminClient, storeName, keyStrings, keyType);
         }
@@ -572,7 +652,7 @@ public class AdminCommandDebug extends AbstractAdminCommand {
                                         List<String> keyStrings,
                                         String keyType) throws DecoderException {
             Cluster cluster = adminClient.getAdminClientCluster();
-            List<StoreDefinition> storeDefs = adminClient.metadataMgmtOps.getRemoteStoreDefList(0)
+            List<StoreDefinition> storeDefs = adminClient.metadataMgmtOps.getRemoteStoreDefList()
                                                                          .getValue();
             StoreDefinition storeDef = StoreDefinitionUtils.getStoreDefinitionWithName(storeDefs,
                                                                                        storeName);
@@ -611,14 +691,15 @@ public class AdminCommandDebug extends AbstractAdminCommand {
                         numReplicas = zoneRepMap.get(zone.getId());
                     }
 
-                    System.out.format("%s%s%s\n",
+                    String FormatString = "%s %s %s\n";
+                    System.out.format(FormatString,
                                       Utils.paddedString("REPLICA#", COLUMN_WIDTH),
                                       Utils.paddedString("PARTITION", COLUMN_WIDTH),
                                       Utils.paddedString("NODE", COLUMN_WIDTH));
                     for(int i = 0; i < numReplicas; i++) {
                         Integer nodeId = bRoutingPlan.getNodeIdForZoneNary(zone.getId(), i, key);
                         Integer partitionId = routingPlan.getNodesPartitionIdForKey(nodeId, key);
-                        System.out.format("%s%s%s\n",
+                        System.out.format(FormatString,
                                           Utils.paddedString(i + "", COLUMN_WIDTH),
                                           Utils.paddedString(partitionId.toString(), COLUMN_WIDTH),
                                           Utils.paddedString(nodeId

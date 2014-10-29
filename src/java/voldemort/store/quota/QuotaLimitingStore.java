@@ -21,7 +21,6 @@ import java.util.Map;
 
 import org.apache.log4j.Logger;
 
-import voldemort.VoldemortApplicationException;
 import voldemort.VoldemortException;
 import voldemort.store.DelegatingStore;
 import voldemort.store.Store;
@@ -43,8 +42,6 @@ public class QuotaLimitingStore extends DelegatingStore<ByteArray, byte[], byte[
 
     private final String getQuotaKey;
     private final String putQuotaKey;
-    private final String getAllQuotaKey;
-    private final String deleteQuotaKey;
 
     public QuotaLimitingStore(Store<ByteArray, byte[], byte[]> innerStore,
                               StoreStats storeStats,
@@ -56,11 +53,21 @@ public class QuotaLimitingStore extends DelegatingStore<ByteArray, byte[], byte[
 
         this.getQuotaKey = QuotaUtils.makeQuotaKey(innerStore.getName(), QuotaType.GET_THROUGHPUT);
         this.putQuotaKey = QuotaUtils.makeQuotaKey(innerStore.getName(), QuotaType.PUT_THROUGHPUT);
-        this.getAllQuotaKey = QuotaUtils.makeQuotaKey(innerStore.getName(),
-                                                      QuotaType.GET_ALL_THROUGHPUT);
-        this.deleteQuotaKey = QuotaUtils.makeQuotaKey(innerStore.getName(),
-                                                      QuotaType.DELETE_THROUGHPUT);
         this.quotaStats = quotaStats;
+    }
+
+    private float getThroughput(Tracked trackedOp) {
+        if(trackedOp.equals(Tracked.GET)) {
+            float getThroughPut = this.storeStats.getThroughput(Tracked.GET);
+            float getAllThroughPut = this.storeStats.getGetAllKeysThroughput();
+            return getThroughPut + getAllThroughPut;
+        } else if(trackedOp.equals(Tracked.PUT)) {
+            float putThroughPut = this.storeStats.getThroughput(Tracked.PUT);
+            float deleteThroughPut = this.storeStats.getThroughput(Tracked.DELETE);
+            return putThroughPut + deleteThroughPut;
+        } else {
+            throw new IllegalArgumentException("Expected GET or PUT, received " + trackedOp);
+        }
     }
 
     /**
@@ -79,7 +86,7 @@ public class QuotaLimitingStore extends DelegatingStore<ByteArray, byte[], byte[
                 return;
             }
             // But, if it does
-            float currentRate = this.storeStats.getThroughput(trackedOp);
+            float currentRate = getThroughput(trackedOp);
             float allowedRate = Float.parseFloat(quotaValue);
             // TODO the histogram should be reasonably accurate to do all
             // these things.. (ghost qps and all)
@@ -90,12 +97,9 @@ public class QuotaLimitingStore extends DelegatingStore<ByteArray, byte[], byte[
             // check if we have exceeded rate.
             if(currentRate > allowedRate) {
                 quotaStats.reportRateLimitedOp(trackedOp);
-                // TODO should be throwing a whole new class of Exception here.
-                // But, then it warrants a client code dependency to be able to
-                // recognize the exception.So may be later.
-                throw new VoldemortApplicationException("Exceeded rate limit for " + quotaKey
-                                                        + ". Maximum allowed : " + allowedRate
-                                                        + " Current: " + currentRate);
+                throw new QuotaExceededException("Exceeded rate limit for " + quotaKey
+                                                 + ". Maximum allowed : " + allowedRate
+                                                 + " Current: " + currentRate);
             }
         } catch(NumberFormatException nfe) {
             // move on, if we cannot parse quota value properly
@@ -106,7 +110,10 @@ public class QuotaLimitingStore extends DelegatingStore<ByteArray, byte[], byte[
 
     @Override
     public boolean delete(ByteArray key, Version version) throws VoldemortException {
-        checkRateLimit(deleteQuotaKey, Tracked.DELETE);
+        // We want to have only 2 Quotas read and write, hence the Delete uses
+        // PUT. It would be easier if we rename PUT, GET to WRITE,READ
+        // but for backward compatibility we are sticking with old names.
+        checkRateLimit(putQuotaKey, Tracked.PUT);
         return super.delete(key, version);
     }
 
@@ -120,7 +127,10 @@ public class QuotaLimitingStore extends DelegatingStore<ByteArray, byte[], byte[
     public Map<ByteArray, List<Versioned<byte[]>>> getAll(Iterable<ByteArray> keys,
                                                           Map<ByteArray, byte[]> transforms)
             throws VoldemortException {
-        checkRateLimit(getAllQuotaKey, Tracked.GET_ALL);
+        // We want to have only 2 Quotas read and write, hence the GetAll uses
+        // GET. It would be easier if we rename PUT, GET to WRITE,READ
+        // but for backward compatibility we are sticking with old names.
+        checkRateLimit(getQuotaKey, Tracked.GET);
         return super.getAll(keys, transforms);
     }
 

@@ -384,11 +384,22 @@ public class AdminServiceBasicTest {
         }
 
         // Reset the store definition back to original
-        for(int nodeId: this.cluster.getNodeIds()) {
-            adminClient.metadataMgmtOps.updateRemoteStoreDefList(nodeId,
-                                                                 originalStoreDefinitionsList);
-        }
+        adminClient.metadataMgmtOps.updateRemoteStoreDefList(originalStoreDefinitionsList,
+                                                             this.cluster.getNodeIds());
 
+    }
+
+    @Test
+    public void testFetchSingleStoreFromAdminClient() {
+        String storeName = "test-replication-memory";
+        StoreDefinitionsMapper mapper = new StoreDefinitionsMapper();
+
+        for(int nodeId: this.cluster.getNodeIds()) {
+            Versioned<String> storeDef = adminClient.metadataMgmtOps.getRemoteMetadata(nodeId,
+                                                                                       storeName);
+            List<StoreDefinition> def = mapper.readStoreList(new StringReader(storeDef.getValue()));
+            assertEquals(def.get(0).getName(), storeName);
+        }
     }
 
     @Test

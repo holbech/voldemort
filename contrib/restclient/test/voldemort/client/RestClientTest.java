@@ -7,19 +7,24 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 
+import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
 import voldemort.ServerTestUtils;
+import voldemort.TestUtils;
 import voldemort.cluster.Cluster;
-import voldemort.rest.coordinator.CoordinatorConfig;
-import voldemort.rest.coordinator.CoordinatorService;
+import voldemort.rest.coordinator.CoordinatorProxyService;
+import voldemort.rest.coordinator.config.CoordinatorConfig;
+import voldemort.rest.coordinator.config.FileBasedStoreClientConfigService;
+import voldemort.rest.coordinator.config.StoreClientConfigService;
 import voldemort.restclient.RESTClientFactory;
 import voldemort.restclient.RESTClientFactoryConfig;
 import voldemort.server.VoldemortServer;
@@ -33,12 +38,13 @@ import voldemort.versioning.Versioned;
 public class RestClientTest extends DefaultStoreClientTest {
 
     private static final String STORE_NAME = "test";
-    private static final String FAT_CLIENT_CONFIG_PATH = "test/common/coordinator/config/clientConfigs.avro";
+    private static final String FAT_CLIENT_CONFIG_PATH_ORIGINAL = "test/common/coordinator/config/clientConfigs.avro";
+    private static File COPY_OF_FAT_CLIENT_CONFIG_FILE;
     private static String storesXmlfile = "test/common/voldemort/config/two-stores.xml";
 
     String[] bootStrapUrls = null;
     private VoldemortServer[] servers;
-    private CoordinatorService coordinator;
+    private CoordinatorProxyService coordinator;
     private Cluster cluster;
     public static String socketUrl = "";
     private SocketStoreFactory socketStoreFactory = new ClientRequestExecutorPool(2,
@@ -48,7 +54,7 @@ public class RestClientTest extends DefaultStoreClientTest {
 
     @Override
     @Before
-    public void setUp() {
+    public void setUp() throws IOException {
         final int numServers = 1;
         this.nodeId = 0;
         this.time = SystemTime.INSTANCE;
@@ -74,16 +80,33 @@ public class RestClientTest extends DefaultStoreClientTest {
         List<String> bootstrapUrls = new ArrayList<String>();
         bootstrapUrls.add(socketUrl);
 
+        // create a copy of the config file in a temp directory and work on that
+        File src = new File(FAT_CLIENT_CONFIG_PATH_ORIGINAL);
+        COPY_OF_FAT_CLIENT_CONFIG_FILE = new File(TestUtils.createTempDir(),
+                                                  "clientConfigs" + System.currentTimeMillis()
+                                                          + ".avro");
+        FileUtils.copyFile(src, COPY_OF_FAT_CLIENT_CONFIG_FILE);
+
         // Setup the Coordinator
         CoordinatorConfig coordinatorConfig = new CoordinatorConfig();
         coordinatorConfig.setBootstrapURLs(bootstrapUrls)
                          .setCoordinatorCoreThreads(100)
                          .setCoordinatorMaxThreads(100)
-                         .setFatClientConfigPath(FAT_CLIENT_CONFIG_PATH)
+                         .setFatClientConfigPath(COPY_OF_FAT_CLIENT_CONFIG_FILE.getAbsolutePath())
                          .setServerPort(9999);
 
         try {
-            coordinator = new CoordinatorService(coordinatorConfig);
+            StoreClientConfigService storeClientConfigs = null;
+            switch(coordinatorConfig.getFatClientConfigSource()) {
+                case FILE:
+                    storeClientConfigs = new FileBasedStoreClientConfigService(coordinatorConfig);
+                    break;
+                case ZOOKEEPER:
+                    throw new UnsupportedOperationException("Zookeeper-based configs are not implemented yet!");
+                default:
+                    storeClientConfigs = null;
+            }
+            coordinator = new CoordinatorProxyService(coordinatorConfig, storeClientConfigs);
             coordinator.start();
         } catch(Exception e) {
             e.printStackTrace();
@@ -107,6 +130,9 @@ public class RestClientTest extends DefaultStoreClientTest {
         }
 
         coordinator.stop();
+
+        // clean up the temporary file created in set up
+        COPY_OF_FAT_CLIENT_CONFIG_FILE.delete();
     }
 
     @Override

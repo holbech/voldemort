@@ -176,7 +176,7 @@ public class StorageService extends AbstractService {
                                                                                                                                           metadata,
                                                                                                                                           config));
         this.failureDetector = create(failureDetectorConfig, config.isJmxEnabled());
-        this.storeStats = new StoreStats();
+        this.storeStats = new StoreStats("aggregate.storage-service");
         this.routedStoreFactory = new RoutedStoreFactory();
         this.routedStoreFactory.setThreadPool(this.clientThreadPool);
         this.routedStoreConfig = new RoutedStoreConfig(this.voldemortConfig,
@@ -879,14 +879,15 @@ public class StorageService extends AbstractService {
             // Wrap everything under the rate limiting store (barring the
             // metadata store)
             if(voldemortConfig.isEnableQuotaLimiting() && !isMetadata) {
+                StoreStats currentStoreStats = statStore.getStats();
                 FileBackedCachingStorageEngine quotaStore = (FileBackedCachingStorageEngine) storeRepository.getStorageEngine(SystemStoreConstants.SystemStoreName.voldsys$_store_quotas.toString());
                 QuotaLimitStats quotaStats = new QuotaLimitStats(this.aggregatedQuotaStats);
                 QuotaLimitingStore rateLimitingStore = new QuotaLimitingStore(store,
-                                                                              this.storeStats,
+                                                                              currentStoreStats,
                                                                               quotaStats,
                                                                               quotaStore);
                 if(voldemortConfig.isJmxEnabled()) {
-                    JmxUtils.registerMbean(this.aggregatedQuotaStats,
+                    JmxUtils.registerMbean(quotaStats,
                                            JmxUtils.createObjectName("voldemort.store.quota",
                                                                      store.getName()
                                                                              + "-quota-limit-stats"));

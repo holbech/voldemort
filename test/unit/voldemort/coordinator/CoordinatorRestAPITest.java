@@ -19,6 +19,7 @@ package voldemort.coordinator;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
+import java.io.File;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -33,15 +34,19 @@ import javax.mail.internet.MimeMultipart;
 import javax.mail.util.ByteArrayDataSource;
 
 import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
 import voldemort.ServerTestUtils;
+import voldemort.TestUtils;
 import voldemort.rest.RestMessageHeaders;
 import voldemort.rest.RestUtils;
-import voldemort.rest.coordinator.CoordinatorConfig;
-import voldemort.rest.coordinator.CoordinatorService;
+import voldemort.rest.coordinator.CoordinatorProxyService;
+import voldemort.rest.coordinator.config.CoordinatorConfig;
+import voldemort.rest.coordinator.config.FileBasedStoreClientConfigService;
+import voldemort.rest.coordinator.config.StoreClientConfigService;
 import voldemort.server.VoldemortServer;
 import voldemort.store.socket.SocketStoreFactory;
 import voldemort.store.socket.clientrequest.ClientRequestExecutorPool;
@@ -54,12 +59,13 @@ public class CoordinatorRestAPITest {
     public static String socketUrl = "";
     private static final String STORE_NAME = "slow-store-test";
     private static final String STORES_XML = "test/common/voldemort/config/single-slow-store.xml";
-    private static final String FAT_CLIENT_CONFIG_FILE_PATH = "test/common/voldemort/config/fat-client-config.avro";
+    private static final String FAT_CLIENT_CONFIG_FILE_PATH_ORIGINAL = "test/common/voldemort/config/fat-client-config.avro";
+    private static File COPY_OF_FAT_CLIENT_CONFIG_FILE;
     private final SocketStoreFactory socketStoreFactory = new ClientRequestExecutorPool(2,
                                                                                         10000,
                                                                                         100000,
                                                                                         32 * 1024);
-    private CoordinatorService coordinator = null;
+    private CoordinatorProxyService coordinator = null;
     private final String coordinatorURL = "http://localhost:8080";
 
     private class TestVersionedValue {
@@ -111,6 +117,13 @@ public class CoordinatorRestAPITest {
                                               STORES_XML,
                                               props);
 
+        // create a copy of the config file in a temp directory and work on that
+        File src = new File(FAT_CLIENT_CONFIG_FILE_PATH_ORIGINAL);
+        COPY_OF_FAT_CLIENT_CONFIG_FILE = new File(TestUtils.createTempDir(),
+                                                  "fat-client-config" + System.currentTimeMillis()
+                                                          + ".avro");
+        FileUtils.copyFile(src, COPY_OF_FAT_CLIENT_CONFIG_FILE);
+
         CoordinatorConfig config = new CoordinatorConfig();
         List<String> bootstrapUrls = new ArrayList<String>();
         socketUrl = servers[0].getIdentityNode().getSocketUrl().toString();
@@ -119,9 +132,18 @@ public class CoordinatorRestAPITest {
         System.out.println("\n\n************************ Starting the Coordinator *************************");
 
         config.setBootstrapURLs(bootstrapUrls);
-        config.setFatClientConfigPath(FAT_CLIENT_CONFIG_FILE_PATH);
-
-        this.coordinator = new CoordinatorService(config);
+        config.setFatClientConfigPath(COPY_OF_FAT_CLIENT_CONFIG_FILE.getAbsolutePath());
+        StoreClientConfigService storeClientConfigs = null;
+        switch(config.getFatClientConfigSource()) {
+            case FILE:
+                storeClientConfigs = new FileBasedStoreClientConfigService(config);
+                break;
+            case ZOOKEEPER:
+                throw new UnsupportedOperationException("Zookeeper-based configs are not implemented yet!");
+            default:
+                storeClientConfigs = null;
+        }
+        this.coordinator = new CoordinatorProxyService(config, storeClientConfigs);
         if(!this.coordinator.isStarted()) {
             this.coordinator.start();
         }
@@ -136,6 +158,43 @@ public class CoordinatorRestAPITest {
         if(this.coordinator != null && this.coordinator.isStarted()) {
             this.coordinator.stop();
         }
+        // clean up the temporary file created in set up
+        COPY_OF_FAT_CLIENT_CONFIG_FILE.delete();
+    }
+
+    public static enum ValueType {
+        ALPHA,
+        ALPHANUMERIC,
+        NUMERIC
+    }
+
+    public static String generateRandomString(int length, ValueType type) {
+
+        StringBuffer buffer = new StringBuffer();
+        String characters = "";
+
+        switch(type) {
+
+            case ALPHA:
+                characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                break;
+
+            case ALPHANUMERIC:
+                characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+                break;
+
+            case NUMERIC:
+                characters = "1234567890";
+                break;
+        }
+
+        int charactersLength = characters.length();
+
+        for(int i = 0; i < length; i++) {
+            double index = Math.random() * charactersLength;
+            buffer.append(characters.charAt((int) index));
+        }
+        return buffer.toString();
     }
 
     private VectorClock doPut(String key, String payload, VectorClock vc) {
@@ -307,7 +366,11 @@ public class CoordinatorRestAPITest {
 
             MimeBodyPart part = (MimeBodyPart) mp.getBodyPart(0);
             VectorClock vc = RestUtils.deserializeVectorClock(part.getHeader(RestMessageHeaders.X_VOLD_VECTOR_CLOCK)[0]);
-            response = (String) part.getContent();
+            int contentLength = Integer.parseInt(part.getHeader(RestMessageHeaders.CONTENT_LENGTH)[0]);
+            byte[] bodyPartBytes = new byte[contentLength];
+
+            part.getInputStream().read(bodyPartBytes);
+            response = new String(bodyPartBytes);
 
             responseObj = new TestVersionedValue(response, vc);
 
@@ -382,6 +445,46 @@ public class CoordinatorRestAPITest {
         String key = "Which_Porter_do_I_want_to_drink";
         String payload = "Founders Porter";
         String newPayload = "Samuel Smith Taddy Porter";
+
+        // 1. Do a put
+        doPut(key, payload, null);
+
+        // 2. Do a get on the same key
+        TestVersionedValue response = doGet(key, null);
+        if(response == null) {
+            fail("key does not exist after a put. ");
+        }
+        System.out.println("Received value: " + response.getValue());
+
+        // 3. Do a versioned put based on the version received previously
+        doPut(key, newPayload, response.getVc());
+
+        // 4. Do a get again on the same key
+        TestVersionedValue newResponse = doGet(key);
+        if(newResponse == null) {
+            fail("key does not exist after the versioned put. ");
+        }
+        assertEquals("Returned response does not have a higer version",
+                     Occurred.AFTER,
+                     newResponse.getVc().compare(response.getVc()));
+        assertEquals("Returned response does not have a higer version",
+                     Occurred.BEFORE,
+                     response.getVc().compare(newResponse.getVc()));
+
+        System.out.println("Received value after the Versioned put: " + newResponse.getValue());
+        if(!newResponse.getValue().equals(newPayload)) {
+            fail("Received value is incorrect ! Expected : " + newPayload + " but got : "
+                 + newResponse.getValue());
+        }
+    }
+
+    @Test
+    public void testLargeValueSizeVersionedPut() {
+        String key = "amigo";
+        String payload = generateRandomString(new CoordinatorConfig().getHttpMessageDecoderMaxChunkSize() * 10,
+                                              ValueType.ALPHA);
+        String newPayload = generateRandomString(new CoordinatorConfig().getHttpMessageDecoderMaxChunkSize() * 10,
+                                                 ValueType.ALPHA);
 
         // 1. Do a put
         doPut(key, payload, null);
